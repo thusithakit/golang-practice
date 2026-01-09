@@ -12,63 +12,84 @@ type Handler struct {
 	data *models.DashboardData
 }
 
-// NewHandler injects the pre-calculated data into the API layer
 func NewHandler(data *models.DashboardData) *Handler {
 	return &Handler{data: data}
 }
 
-// RegisterRoutes maps the endpoints to functions
 func (h *Handler) RegisterRoutes(e *echo.Echo) {
 	api := e.Group("/api")
-
-	api.GET("/revenue", h.GetRevenueByCountry)   // Q1: Country Stats
-	api.GET("/products/top", h.GetTopProducts)   // Q2: Top 20 Products
-	api.GET("/regions/top", h.GetTopRegions)     // Q3: Top Regions
-	api.GET("/sales/monthly", h.GetMonthlySales) // Q4: Monthly Trend
+	api.GET("/revenue", h.GetRevenueByCountry)   // ?limit=10&offset=0
+	api.GET("/products/top", h.GetTopProducts)   // ?limit=5
+	api.GET("/regions/top", h.GetTopRegions)     // ?limit=5
+	api.GET("/sales/monthly", h.GetMonthlySales) // No params needed
 }
 
 // --- HANDLERS ---
 
-// GetRevenueByCountry returns the list of countries sorted by revenue.
-// Supports query params: ?page=1&limit=50
+// Helper to parse limit/offset safely
+func getPaginationParams(c echo.Context, defaultLimit int) (int, int) {
+	limit, err := strconv.Atoi(c.QueryParam("limit"))
+	if err != nil || limit <= 0 {
+		limit = defaultLimit
+	}
+	offset, err := strconv.Atoi(c.QueryParam("offset"))
+	if err != nil || offset < 0 {
+		offset = 0
+	}
+	return limit, offset
+}
+
+// GetRevenueByCountry returns country stats with pagination.
+// Default: All items (limit=1000)
 func (h *Handler) GetRevenueByCountry(c echo.Context) error {
 	stats := h.data.CountryStats
+	total := len(stats)
 
-	// Simple Pagination Logic
-	page, _ := strconv.Atoi(c.QueryParam("page"))
-	limit, _ := strconv.Atoi(c.QueryParam("limit"))
+	// Default to returning everything if no params provided,
+	// but allow slicing if requested.
+	limit, offset := getPaginationParams(c, total)
 
-	if page < 1 {
-		page = 1
-	}
-	if limit < 1 {
-		// Return all if no limit specified (fastest for small lists ~200 items)
-		return c.JSON(http.StatusOK, stats)
-	}
-
-	start := (page - 1) * limit
-	if start >= len(stats) {
+	if offset >= total {
 		return c.JSON(http.StatusOK, []models.CountryStat{})
 	}
-	end := start + limit
-	if end > len(stats) {
-		end = len(stats)
+
+	end := offset + limit
+	if end > total {
+		end = total
 	}
 
-	return c.JSON(http.StatusOK, stats[start:end])
+	// Return sliced data
+	return c.JSON(http.StatusOK, map[string]interface{}{
+		"data":   stats[offset:end],
+		"total":  total,
+		"limit":  limit,
+		"offset": offset,
+	})
 }
 
-// GetTopProducts returns the top 20 products
+// GetTopProducts returns Top 20 (calculated) but allows frontend to request fewer (e.g., Top 5)
 func (h *Handler) GetTopProducts(c echo.Context) error {
-	return c.JSON(http.StatusOK, h.data.TopProducts)
+	data := h.data.TopProducts
+	limit, _ := getPaginationParams(c, len(data))
+
+	if limit < len(data) {
+		return c.JSON(http.StatusOK, data[:limit])
+	}
+	return c.JSON(http.StatusOK, data)
 }
 
-// GetTopRegions returns the top performing regions
+// GetTopRegions returns Top 30 (calculated) but allows frontend to request fewer
 func (h *Handler) GetTopRegions(c echo.Context) error {
-	return c.JSON(http.StatusOK, h.data.TopRegions)
+	data := h.data.TopRegions
+	limit, _ := getPaginationParams(c, len(data))
+
+	if limit < len(data) {
+		return c.JSON(http.StatusOK, data[:limit])
+	}
+	return c.JSON(http.StatusOK, data)
 }
 
-// GetMonthlySales returns sales volume by month (Jan -> Dec)
+// GetMonthlySales is fixed at 12 months, no pagination needed.
 func (h *Handler) GetMonthlySales(c echo.Context) error {
 	return c.JSON(http.StatusOK, h.data.MonthlySales)
 }

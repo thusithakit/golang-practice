@@ -6,13 +6,19 @@ import (
 	"os"
 	"runtime"
 	"sync"
-	"syscall"
 	"time"
 	"unsafe"
 )
 
-// --- 1. SUPER-FAST PARSERS (Same as before) ---
-// (Keep fastFloat, fastInt, fastDate, unsafeToString from previous step)
+// --- Fast Parsers ---
+func unsafeToString(b []byte) string { return *(*string)(unsafe.Pointer(&b)) }
+func fastInt(b []byte) int32 {
+	var n int32
+	for _, c := range b {
+		n = n*10 + int32(c-'0')
+	}
+	return n
+}
 func fastFloat(b []byte) float64 {
 	var num float64
 	var i int
@@ -31,90 +37,53 @@ func fastFloat(b []byte) float64 {
 	}
 	return num
 }
-
-func fastInt(b []byte) int32 {
-	var n int32
-	for _, c := range b {
-		n = n*10 + int32(c-'0')
-	}
-	return n
-}
-
 func fastDate(b []byte) int32 {
 	if len(b) < 7 {
 		return 0
 	}
+	// Expects YYYY-MM-DD -> YYYYMM
 	y := int32(b[0]-'0')*1000 + int32(b[1]-'0')*100 + int32(b[2]-'0')*10 + int32(b[3]-'0')
 	m := int32(b[5]-'0')*10 + int32(b[6]-'0')
 	return y*100 + m
 }
 
-func unsafeToString(b []byte) string {
-	return *(*string)(unsafe.Pointer(&b))
-}
-
-// --- 2. MMAP LOADER ---
-
+// --- Parallel Loader ---
 func LoadColumnar(path string) *ColumnStore {
 	start := time.Now()
-	log.Println("Loading data (MMAP + Parallel)...")
+	log.Println("Loading data (Parallel Columnar)...")
 
-	// A. Open File
-	f, err := os.Open(path)
+	// 1. Read File
+	content, err := os.ReadFile(path)
 	if err != nil {
 		log.Fatal(err)
 	}
-
-	// Get File Size
-	fi, err := f.Stat()
-	if err != nil {
-		log.Fatal(err)
-	}
-	size := fi.Size()
-
-	// B. Memory Map (The Magic)
-	// PROT_READ: Read Only
-	// MAP_SHARED: Shared with other processes (standard for file mapping)
-	data, err := syscall.Mmap(int(f.Fd()), 0, int(size), syscall.PROT_READ, syscall.MAP_SHARED)
-	if err != nil {
-		log.Fatal("mmap failed:", err)
-	}
-
-	// We can close the file handle immediately; the map remains valid.
-	f.Close()
-
-	// Defer Unmap to clean up memory when we return (optional, depends on lifecycle)
-	// WARNING: If we unmap, any "unsafeString" references will SEGFAULT.
-	// Since our Dictionary copies strings (string(val)), we are safe to unmap
-	// AFTER we are done parsing.
-	defer syscall.Munmap(data)
-
-	// --- C. PARALLEL PARSING (Same Logic, Higher Speed) ---
 
 	numWorkers := runtime.NumCPU()
-	chunkSize := len(data) / numWorkers
+
+	// 2. Count Rows (Parallel) for Exact Allocation
+	chunkSize := len(content) / numWorkers
 	rowCounts := make([]int, numWorkers)
 	var countWg sync.WaitGroup
 
-	// 1. Count Rows (Parallel)
 	for i := 0; i < numWorkers; i++ {
 		countWg.Add(1)
 		go func(idx int, start, end int) {
 			defer countWg.Done()
+			// Align to newlines
 			if start > 0 {
-				if i := bytes.IndexByte(data[start:], '\n'); i != -1 {
+				if i := bytes.IndexByte(content[start:], '\n'); i != -1 {
 					start += i + 1
 				}
 			}
-			if end < len(data) {
-				if i := bytes.IndexByte(data[end:], '\n'); i != -1 {
+			if end < len(content) {
+				if i := bytes.IndexByte(content[end:], '\n'); i != -1 {
 					end += i + 1
 				} else {
-					end = len(data)
+					end = len(content)
 				}
 			}
 			if start < end {
-				rowCounts[idx] = bytes.Count(data[start:end], []byte{'\n'})
+				rowCounts[idx] = bytes.Count(content[start:end], []byte{'\n'})
 			}
 		}(i, i*chunkSize, (i+1)*chunkSize)
 	}
@@ -125,7 +94,7 @@ func LoadColumnar(path string) *ColumnStore {
 		totalRows += c
 	}
 
-	// 2. Alloc Store
+	// 3. Allocate Store ONCE
 	store := &ColumnStore{
 		Revenues:   make([]float64, totalRows),
 		Dates:      make([]int32, totalRows),
@@ -136,6 +105,7 @@ func LoadColumnar(path string) *ColumnStore {
 		ProductIDs: make([]int32, totalRows),
 	}
 
+	// Calculate write offsets
 	offsets := make([]int, numWorkers)
 	curr := 0
 	for i, c := range rowCounts {
@@ -143,7 +113,7 @@ func LoadColumnar(path string) *ColumnStore {
 		curr += c
 	}
 
-	// 3. Local Dicts
+	// 4. Parse & Fill (Parallel)
 	type localDicts struct {
 		cMap  map[string]int32
 		cList []string
@@ -157,33 +127,34 @@ func LoadColumnar(path string) *ColumnStore {
 	}
 	workerDicts := make([]*localDicts, numWorkers)
 
-	// 4. Parse (Parallel)
 	var parseWg sync.WaitGroup
 	for i := 0; i < numWorkers; i++ {
 		parseWg.Add(1)
 		go func(idx int, start, end int, writeOffset int) {
 			defer parseWg.Done()
 
+			// Init local dicts
 			ld := &localDicts{
 				cMap: make(map[string]int32), rMap: make(map[string]int32), pMap: make(map[string]int32),
 				idsC: make([]int32, rowCounts[idx]), idsR: make([]int32, rowCounts[idx]), idsP: make([]int32, rowCounts[idx]),
 			}
 			workerDicts[idx] = ld
 
+			// Align chunk again
 			if start > 0 {
-				if i := bytes.IndexByte(data[start:], '\n'); i != -1 {
+				if i := bytes.IndexByte(content[start:], '\n'); i != -1 {
 					start += i + 1
 				}
 			}
-			if end < len(data) {
-				if i := bytes.IndexByte(data[end:], '\n'); i != -1 {
+			if end < len(content) {
+				if i := bytes.IndexByte(content[end:], '\n'); i != -1 {
 					end += i + 1
 				} else {
-					end = len(data)
+					end = len(content)
 				}
 			}
 
-			chunk := data[start:end]
+			chunk := content[start:end]
 			pos := 0
 			row := 0
 			var val []byte
@@ -209,22 +180,19 @@ func LoadColumnar(path string) *ColumnStore {
 
 				colIdx = 0
 				lastScan := 0
-
 				for k := 0; k <= len(line); k++ {
 					if k == len(line) || line[k] == ',' {
 						val = line[lastScan:k]
-
 						switch colIdx {
 						case 1:
 							store.Dates[writeOffset+row] = fastDate(val)
 						case 3:
-							s := unsafeToString(val)
+							s := unsafeToString(val) // Safe because 'content' lives forever
 							if id, ok := ld.cMap[s]; ok {
 								ld.idsC[row] = id
 							} else {
 								id = int32(len(ld.cList))
-								// IMPORTANT: We MUST copy the string here (string(val))
-								// because 'val' points to mmap memory which will be Unmapped later.
+								// Allocate string here for the dictionary
 								str := string(val)
 								ld.cList = append(ld.cList, str)
 								ld.cMap[str] = id
@@ -269,7 +237,7 @@ func LoadColumnar(path string) *ColumnStore {
 	}
 	parseWg.Wait()
 
-	// 5. Merge Dicts (Parallel)
+	// 5. Merge Dictionaries
 	var dictWg sync.WaitGroup
 	dictWg.Add(3)
 
@@ -308,7 +276,6 @@ func LoadColumnar(path string) *ColumnStore {
 	go mergeDict(func(d *localDicts) []string { return d.pList }, func(d *localDicts) []int32 { return d.idsP }, &store.ProductDict, store.ProductIDs)
 
 	dictWg.Wait()
-
-	log.Printf("MMAP Load Complete. Rows: %d. Time: %v", totalRows, time.Since(start))
+	log.Printf("Load Complete. Rows: %d. Time: %v", totalRows, time.Since(start))
 	return store
 }

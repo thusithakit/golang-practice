@@ -4,6 +4,8 @@ import (
 	"backend/internal/api"
 	"backend/internal/engine"
 	"log"
+	"os"
+	"runtime"
 	"time"
 
 	"github.com/labstack/echo/v4"
@@ -11,25 +13,33 @@ import (
 )
 
 func main() {
+	log.Println("Starting System (Modular Engine)...")
+	csvFile := "GO_Test.csv"
+	if _, err := os.Stat(csvFile); os.IsNotExist(err) {
+		log.Fatal("CSV not found")
+	}
+
+	// 1. LOAD
+	store := engine.LoadColumnar(csvFile)
+
+	// 2. AGGREGATE
+	log.Println("Aggregating...")
+	t0 := time.Now()
+	data := store.Aggregate()
+	log.Printf("Aggregation Complete in %v", time.Since(t0))
+
+	// Free memory (Optional)
+	store = nil
+	runtime.GC()
+
+	// 3. SERVE
 	e := echo.New()
 	e.Use(middleware.CORS())
-	e.Use(middleware.Recover())
 	e.Use(middleware.Logger())
 
-	h := api.NewHandler(nil)
+	h := api.NewHandler(data)
 	h.RegisterRoutes(e)
 
-	go func() {
-		log.Println("BACKGROUND: Starting ETL Pipeline...")
-		t0 := time.Now()
-
-		store := engine.LoadColumnar("GO_Test.csv")
-		dashboardData := store.Aggregate()
-		h.SetData(dashboardData)
-
-		log.Printf("BACKGROUND: ETL Complete in %v. API is fully ready.", time.Since(t0))
-	}()
-
-	log.Println("Server ready on port 8080 (Data loading in background...)")
+	log.Println("Server ready on port 8080")
 	e.Logger.Fatal(e.Start(":8080"))
 }

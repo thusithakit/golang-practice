@@ -10,8 +10,13 @@ import (
 	"unsafe"
 )
 
-// --- Fast Parsers ---
-func unsafeToString(b []byte) string { return *(*string)(unsafe.Pointer(&b)) }
+// --- 1. FAST ZERO-ALLOC PARSERS ---
+
+func unsafeToString(b []byte) string {
+	return *(*string)(unsafe.Pointer(&b))
+}
+
+// fastInt parses "123" -> 123
 func fastInt(b []byte) int32 {
 	var n int32
 	for _, c := range b {
@@ -19,6 +24,8 @@ func fastInt(b []byte) int32 {
 	}
 	return n
 }
+
+// fastFloat parses "123.45" -> 123.45
 func fastFloat(b []byte) float64 {
 	var num float64
 	var i int
@@ -37,30 +44,40 @@ func fastFloat(b []byte) float64 {
 	}
 	return num
 }
+
+// fastDate parses "2021-07-25" -> 202107 (YYYYMM)
 func fastDate(b []byte) int32 {
 	if len(b) < 7 {
 		return 0
 	}
-	// Expects YYYY-MM-DD -> YYYYMM
+	// Optimistically assumes fixed format YYYY-MM-DD
 	y := int32(b[0]-'0')*1000 + int32(b[1]-'0')*100 + int32(b[2]-'0')*10 + int32(b[3]-'0')
 	m := int32(b[5]-'0')*10 + int32(b[6]-'0')
 	return y*100 + m
 }
 
-// --- Parallel Loader ---
+// --- 2. MAIN LOADER ---
+
 func LoadColumnar(path string) *ColumnStore {
 	start := time.Now()
-	log.Println("Loading data (Parallel Columnar)...")
+	log.Println("Loading data (Parallel Unrolled)...")
 
-	// 1. Read File
+	// A. Read File
 	content, err := os.ReadFile(path)
 	if err != nil {
 		log.Fatal(err)
 	}
 
+	// --- FIX: SKIP HEADER ROW ---
+	// We advance the slice past the first newline character.
+	if idx := bytes.IndexByte(content, '\n'); idx != -1 {
+		content = content[idx+1:]
+	}
+	// ----------------------------
+
 	numWorkers := runtime.NumCPU()
 
-	// 2. Count Rows (Parallel) for Exact Allocation
+	// B. Count Rows (Parallel) for Exact Allocation
 	chunkSize := len(content) / numWorkers
 	rowCounts := make([]int, numWorkers)
 	var countWg sync.WaitGroup
@@ -94,7 +111,7 @@ func LoadColumnar(path string) *ColumnStore {
 		totalRows += c
 	}
 
-	// 3. Allocate Store ONCE
+	// C. Allocate Store ONCE
 	store := &ColumnStore{
 		Revenues:   make([]float64, totalRows),
 		Dates:      make([]int32, totalRows),
@@ -105,7 +122,6 @@ func LoadColumnar(path string) *ColumnStore {
 		ProductIDs: make([]int32, totalRows),
 	}
 
-	// Calculate write offsets
 	offsets := make([]int, numWorkers)
 	curr := 0
 	for i, c := range rowCounts {
@@ -113,7 +129,7 @@ func LoadColumnar(path string) *ColumnStore {
 		curr += c
 	}
 
-	// 4. Parse & Fill (Parallel)
+	// D. Parallel Parsing (Unrolled)
 	type localDicts struct {
 		cMap  map[string]int32
 		cList []string
@@ -126,6 +142,9 @@ func LoadColumnar(path string) *ColumnStore {
 		idsP  []int32
 	}
 	workerDicts := make([]*localDicts, numWorkers)
+
+	// Pre-define separator for bytes.Cut
+	sep := []byte{','}
 
 	var parseWg sync.WaitGroup
 	for i := 0; i < numWorkers; i++ {
@@ -157,87 +176,132 @@ func LoadColumnar(path string) *ColumnStore {
 			chunk := content[start:end]
 			pos := 0
 			row := 0
-			var val []byte
-			var colIdx, nextPos int
 
+			// HOT LOOP: Unrolled Parsing using bytes.Cut
 			for pos < len(chunk) {
-				nextPos = -1
-				for k := pos; k < len(chunk); k++ {
-					if chunk[k] == '\n' {
-						nextPos = k
-						break
-					}
-				}
-				if nextPos == -1 {
+				// 1. Find line end
+				nextPos := -1
+				if i := bytes.IndexByte(chunk[pos:], '\n'); i != -1 {
+					nextPos = pos + i
+				} else {
 					nextPos = len(chunk)
 				}
 
 				line := chunk[pos:nextPos]
 				pos = nextPos + 1
+
 				if len(line) == 0 {
 					continue
 				}
 
-				colIdx = 0
-				lastScan := 0
-				for k := 0; k <= len(line); k++ {
-					if k == len(line) || line[k] == ',' {
-						val = line[lastScan:k]
-						switch colIdx {
-						case 1:
-							store.Dates[writeOffset+row] = fastDate(val)
-						case 3:
-							s := unsafeToString(val) // Safe because 'content' lives forever
-							if id, ok := ld.cMap[s]; ok {
-								ld.idsC[row] = id
-							} else {
-								id = int32(len(ld.cList))
-								// Allocate string here for the dictionary
-								str := string(val)
-								ld.cList = append(ld.cList, str)
-								ld.cMap[str] = id
-								ld.idsC[row] = id
-							}
-						case 4:
-							s := unsafeToString(val)
-							if id, ok := ld.rMap[s]; ok {
-								ld.idsR[row] = id
-							} else {
-								id = int32(len(ld.rList))
-								str := string(val)
-								ld.rList = append(ld.rList, str)
-								ld.rMap[str] = id
-								ld.idsR[row] = id
-							}
-						case 6:
-							s := unsafeToString(val)
-							if id, ok := ld.pMap[s]; ok {
-								ld.idsP[row] = id
-							} else {
-								id = int32(len(ld.pList))
-								str := string(val)
-								ld.pList = append(ld.pList, str)
-								ld.pMap[str] = id
-								ld.idsP[row] = id
-							}
-						case 9:
-							store.Quantities[writeOffset+row] = fastInt(val)
-						case 10:
-							store.Revenues[writeOffset+row] = fastFloat(val)
-						case 11:
-							store.Stocks[writeOffset+row] = fastInt(val)
-						}
-						lastScan = k + 1
-						colIdx++
+				// 2. Unrolled Field Skipping
+				// We "hop" over fields. No Loop. No Switch.
+
+				var field []byte
+				var rest = line
+				var found bool
+
+				// 0: Transaction ID (SKIP)
+				if _, rest, found = bytes.Cut(rest, sep); !found {
+					continue
+				}
+
+				// 1: Date (KEEP)
+				if field, rest, found = bytes.Cut(rest, sep); found {
+					store.Dates[writeOffset+row] = fastDate(field)
+				}
+
+				// 2: User ID (SKIP)
+				if _, rest, found = bytes.Cut(rest, sep); !found {
+					continue
+				}
+
+				// 3: Country (KEEP)
+				if field, rest, found = bytes.Cut(rest, sep); found {
+					s := unsafeToString(field)
+					if id, ok := ld.cMap[s]; ok {
+						ld.idsC[row] = id
+					} else {
+						id = int32(len(ld.cList))
+						str := string(field) // Allocate string for dict
+						ld.cList = append(ld.cList, str)
+						ld.cMap[str] = id
+						ld.idsC[row] = id
 					}
 				}
+
+				// 4: Region (KEEP)
+				if field, rest, found = bytes.Cut(rest, sep); found {
+					s := unsafeToString(field)
+					if id, ok := ld.rMap[s]; ok {
+						ld.idsR[row] = id
+					} else {
+						id = int32(len(ld.rList))
+						str := string(field)
+						ld.rList = append(ld.rList, str)
+						ld.rMap[str] = id
+						ld.idsR[row] = id
+					}
+				}
+
+				// 5: Product ID (SKIP - we use Name)
+				if _, rest, found = bytes.Cut(rest, sep); !found {
+					continue
+				}
+
+				// 6: Product Name (KEEP)
+				if field, rest, found = bytes.Cut(rest, sep); found {
+					s := unsafeToString(field)
+					if id, ok := ld.pMap[s]; ok {
+						ld.idsP[row] = id
+					} else {
+						id = int32(len(ld.pList))
+						str := string(field)
+						ld.pList = append(ld.pList, str)
+						ld.pMap[str] = id
+						ld.idsP[row] = id
+					}
+				}
+
+				// 7: Category (SKIP)
+				if _, rest, found = bytes.Cut(rest, sep); !found {
+					continue
+				}
+
+				// 8: Price (SKIP)
+				if _, rest, found = bytes.Cut(rest, sep); !found {
+					continue
+				}
+
+				// 9: Quantity (KEEP)
+				if field, rest, found = bytes.Cut(rest, sep); found {
+					store.Quantities[writeOffset+row] = fastInt(field)
+				}
+
+				// 10: Total Revenue (KEEP)
+				if field, rest, found = bytes.Cut(rest, sep); found {
+					store.Revenues[writeOffset+row] = fastFloat(field)
+				}
+
+				// 11: Stock (KEEP - Last value before end or comma)
+				// Note: if there is a 12th column (added_date), we must Cut again.
+				// Based on sample, there is a 12th column. So we Cut.
+				if field, rest, found = bytes.Cut(rest, sep); found {
+					store.Stocks[writeOffset+row] = fastInt(field)
+				} else {
+					// Fallback if 12th col is missing
+					store.Stocks[writeOffset+row] = fastInt(rest)
+				}
+
+				// 12: Added Date (Implicitly Skipped)
+
 				row++
 			}
 		}(i, i*chunkSize, (i+1)*chunkSize, offsets[i])
 	}
 	parseWg.Wait()
 
-	// 5. Merge Dictionaries
+	// E. Merge Dictionaries (Parallel)
 	var dictWg sync.WaitGroup
 	dictWg.Add(3)
 
@@ -276,6 +340,7 @@ func LoadColumnar(path string) *ColumnStore {
 	go mergeDict(func(d *localDicts) []string { return d.pList }, func(d *localDicts) []int32 { return d.idsP }, &store.ProductDict, store.ProductIDs)
 
 	dictWg.Wait()
+
 	log.Printf("Load Complete. Rows: %d. Time: %v", totalRows, time.Since(start))
 	return store
 }

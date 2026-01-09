@@ -1,10 +1,20 @@
 package models
 
 type DashboardData struct {
+	// 1. The requested array for the first API
+	CountryStats []CountryStat `json:"country_stats"`
+
+	// Other endpoints
 	TopProducts  []TopItem     `json:"top_products"`
 	TopRegions   []TopItem     `json:"top_regions"`
 	MonthlySales []MonthlyItem `json:"monthly_sales"`
-	CountryTable []CountryRow  `json:"country_table"`
+}
+
+// Matches: "country-name, total revenue and number of transactions"
+type CountryStat struct {
+	Country      string  `json:"country"`
+	Revenue      float64 `json:"revenue"`
+	Transactions int     `json:"transactions"`
 }
 
 type TopItem struct {
@@ -15,12 +25,5 @@ type TopItem struct {
 
 type MonthlyItem struct {
 	Month  string  `json:"month"`
-	Volume float64 `json:"volume"`
-}
-
-type CountryRow struct {
-	Country      string  `json:"country"`
-	Product      string  `json:"product"`
-	Revenue      float64 `json:"revenue"`
-	Transactions int     `json:"transactions"`
+	Volume float64 `json:"sales"`
 }

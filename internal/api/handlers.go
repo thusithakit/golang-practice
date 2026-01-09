@@ -4,111 +4,71 @@ import (
 	"backend/internal/models"
 	"net/http"
 	"strconv"
-	"sync"
 
 	"github.com/labstack/echo/v4"
 )
 
-// Handler holds the dashboard data with thread-safety mechanisms
 type Handler struct {
 	data *models.DashboardData
-	mu   sync.RWMutex // Read/Write Mutex to prevent race conditions
 }
 
-// NewHandler initializes the handler (data can be nil initially)
+// NewHandler injects the pre-calculated data into the API layer
 func NewHandler(data *models.DashboardData) *Handler {
 	return &Handler{data: data}
 }
 
-// SetData safely updates the dashboard data from the background ETL process
-func (h *Handler) SetData(newData *models.DashboardData) {
-	h.mu.Lock()
-	defer h.mu.Unlock()
-	h.data = newData
-}
-
-// isReady checks if data is loaded. If not, sends 503 response.
-// Returns true if ready, false if loading.
-func (h *Handler) isReady(c echo.Context) bool {
-	h.mu.RLock()
-	defer h.mu.RUnlock()
-
-	if h.data == nil {
-		c.JSON(http.StatusServiceUnavailable, map[string]string{
-			"status":  "loading",
-			"message": "System is warming up. Please try again in a few seconds.",
-		})
-		return false
-	}
-	return true
-}
-
-// RegisterRoutes connects the endpoints
+// RegisterRoutes maps the endpoints to functions
 func (h *Handler) RegisterRoutes(e *echo.Echo) {
-	e.GET("/api/products/top", h.GetTopProducts)
-	e.GET("/api/regions/top", h.GetTopRegions)
-	e.GET("/api/sales/monthly", h.GetMonthlySales)
-	e.GET("/api/revenue", h.GetRevenueTable)
+	api := e.Group("/api")
+
+	api.GET("/revenue", h.GetRevenueByCountry)   // Q1: Country Stats
+	api.GET("/products/top", h.GetTopProducts)   // Q2: Top 20 Products
+	api.GET("/regions/top", h.GetTopRegions)     // Q3: Top Regions
+	api.GET("/sales/monthly", h.GetMonthlySales) // Q4: Monthly Trend
 }
 
-// --- Handler Methods ---
+// --- HANDLERS ---
 
-func (h *Handler) GetTopProducts(c echo.Context) error {
-	if !h.isReady(c) {
-		return nil
-	}
+// GetRevenueByCountry returns the list of countries sorted by revenue.
+// Supports query params: ?page=1&limit=50
+func (h *Handler) GetRevenueByCountry(c echo.Context) error {
+	stats := h.data.CountryStats
 
-	h.mu.RLock()
-	defer h.mu.RUnlock()
-	return c.JSON(http.StatusOK, h.data.TopProducts)
-}
-
-func (h *Handler) GetTopRegions(c echo.Context) error {
-	if !h.isReady(c) {
-		return nil
-	}
-
-	h.mu.RLock()
-	defer h.mu.RUnlock()
-	return c.JSON(http.StatusOK, h.data.TopRegions)
-}
-
-func (h *Handler) GetMonthlySales(c echo.Context) error {
-	if !h.isReady(c) {
-		return nil
-	}
-
-	h.mu.RLock()
-	defer h.mu.RUnlock()
-	return c.JSON(http.StatusOK, h.data.MonthlySales)
-}
-
-func (h *Handler) GetRevenueTable(c echo.Context) error {
-	if !h.isReady(c) {
-		return nil
-	}
-
-	h.mu.RLock()
-	defer h.mu.RUnlock()
-
-	// Pagination Logic
+	// Simple Pagination Logic
 	page, _ := strconv.Atoi(c.QueryParam("page"))
+	limit, _ := strconv.Atoi(c.QueryParam("limit"))
+
 	if page < 1 {
 		page = 1
 	}
-	limit := 50
+	if limit < 1 {
+		// Return all if no limit specified (fastest for small lists ~200 items)
+		return c.JSON(http.StatusOK, stats)
+	}
 
 	start := (page - 1) * limit
-	totalRows := len(h.data.CountryTable)
-
-	if start >= totalRows {
-		return c.JSON(http.StatusOK, []models.CountryRow{})
+	if start >= len(stats) {
+		return c.JSON(http.StatusOK, []models.CountryStat{})
 	}
-
 	end := start + limit
-	if end > totalRows {
-		end = totalRows
+	if end > len(stats) {
+		end = len(stats)
 	}
 
-	return c.JSON(http.StatusOK, h.data.CountryTable[start:end])
+	return c.JSON(http.StatusOK, stats[start:end])
+}
+
+// GetTopProducts returns the top 20 products
+func (h *Handler) GetTopProducts(c echo.Context) error {
+	return c.JSON(http.StatusOK, h.data.TopProducts)
+}
+
+// GetTopRegions returns the top performing regions
+func (h *Handler) GetTopRegions(c echo.Context) error {
+	return c.JSON(http.StatusOK, h.data.TopRegions)
+}
+
+// GetMonthlySales returns sales volume by month (Jan -> Dec)
+func (h *Handler) GetMonthlySales(c echo.Context) error {
+	return c.JSON(http.StatusOK, h.data.MonthlySales)
 }

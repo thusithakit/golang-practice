@@ -2,7 +2,6 @@ package engine
 
 import (
 	"backend/internal/models"
-	"fmt"
 	"math"
 	"runtime"
 	"sort"
@@ -11,7 +10,11 @@ import (
 	"unsafe"
 )
 
-// Atomic Helpers
+var monthNames = [...]string{
+	"", "January", "February", "March", "April", "May", "June",
+	"July", "August", "September", "October", "November", "December",
+}
+
 func addFloat64(val *float64, delta float64) {
 	for {
 		old := math.Float64frombits(atomic.LoadUint64((*uint64)(unsafe.Pointer(val))))
@@ -28,25 +31,25 @@ func (cs *ColumnStore) Aggregate() *models.DashboardData {
 	numRegs := len(cs.RegionDict)
 	numCountries := len(cs.CountryDict)
 
-	// Pre-allocate Global Arrays (Zero Allocation during loop)
+	// Pre-allocate Arrays
 	prodSold := make([]float64, numProds)
 	prodStock := make([]int64, numProds)
 	regRev := make([]float64, numRegs)
 	regSold := make([]int64, numRegs)
-	// Matrix: [Country * NumProds + Product]
-	matrixRev := make([]float64, numCountries*numProds)
-	matrixTx := make([]int64, numCountries*numProds)
+
+	// --- NEW: Country Arrays ---
+	// Tiny memory footprint (~200 items each)
+	ctryRev := make([]float64, numCountries)
+	ctryTx := make([]int64, numCountries)
 
 	// Workers
 	numWorkers := runtime.NumCPU()
 	chunkSize := len(cs.Dates) / numWorkers
-
-	// Local Month Maps (to avoid atomic contention on small date sets)
-	monthPartial := make([]map[int32]float64, numWorkers)
+	monthPartial := make([]map[int]float64, numWorkers)
 	var wg sync.WaitGroup
 
 	for i := 0; i < numWorkers; i++ {
-		monthPartial[i] = make(map[int32]float64)
+		monthPartial[i] = make(map[int]float64)
 		start := i * chunkSize
 		end := start + chunkSize
 		if i == numWorkers-1 {
@@ -57,7 +60,7 @@ func (cs *ColumnStore) Aggregate() *models.DashboardData {
 		go func(idx, s, e int) {
 			defer wg.Done()
 			localMonths := monthPartial[idx]
-			// Hoist slices
+
 			idsP := cs.ProductIDs
 			idsR := cs.RegionIDs
 			idsC := cs.CountryIDs
@@ -69,24 +72,25 @@ func (cs *ColumnStore) Aggregate() *models.DashboardData {
 			for j := s; j < e; j++ {
 				pid := idsP[j]
 				rid := idsR[j]
+				cid := idsC[j]
 				rev := revs[j]
 				qty := qtys[j]
 
-				// Atomic Updates
+				// 1. Products
 				addFloat64(&prodSold[pid], float64(qty))
-				// Simple atomic store for stock (Last-Write-Wins is fine for snapshot)
 				atomic.StoreInt64(&prodStock[pid], int64(stks[j]))
 
+				// 2. Regions
 				addFloat64(&regRev[rid], rev)
 				atomic.AddInt64(&regSold[rid], int64(qty))
 
-				// Matrix
-				midx := int(idsC[j])*numProds + int(pid)
-				addFloat64(&matrixRev[midx], rev)
-				atomic.AddInt64(&matrixTx[midx], 1)
+				// 3. Countries (Revenue + Transactions)
+				addFloat64(&ctryRev[cid], rev)
+				atomic.AddInt64(&ctryTx[cid], 1)
 
-				// Local Month
-				localMonths[dates[j]] += rev
+				// 4. Months
+				mIdx := int(dates[j] % 100)
+				localMonths[mIdx] += rev
 			}
 		}(i, start, end)
 	}
@@ -94,13 +98,29 @@ func (cs *ColumnStore) Aggregate() *models.DashboardData {
 
 	// --- Finalize & Format ---
 	data := &models.DashboardData{
+		CountryStats: make([]models.CountryStat, 0), // The Array you asked for
 		TopProducts:  make([]models.TopItem, 0),
 		TopRegions:   make([]models.TopItem, 0),
 		MonthlySales: make([]models.MonthlyItem, 0),
-		CountryTable: make([]models.CountryRow, 0),
 	}
 
-	// 1. Products
+	// 1. Populate Country Stats
+	for i, revenue := range ctryRev {
+		// Include all countries, or filter if revenue > 0
+		if revenue > 0 {
+			data.CountryStats = append(data.CountryStats, models.CountryStat{
+				Country:      cs.CountryDict[i],
+				Revenue:      revenue,
+				Transactions: int(ctryTx[i]),
+			})
+		}
+	}
+	// Sort by Revenue (Highest first)
+	sort.Slice(data.CountryStats, func(i, j int) bool {
+		return data.CountryStats[i].Revenue > data.CountryStats[j].Revenue
+	})
+
+	// 2. Products
 	for i, v := range prodSold {
 		if v > 0 {
 			data.TopProducts = append(data.TopProducts, models.TopItem{
@@ -113,7 +133,7 @@ func (cs *ColumnStore) Aggregate() *models.DashboardData {
 		data.TopProducts = data.TopProducts[:20]
 	}
 
-	// 2. Regions
+	// 3. Regions
 	for i, v := range regRev {
 		if v > 0 {
 			data.TopRegions = append(data.TopRegions, models.TopItem{
@@ -126,31 +146,27 @@ func (cs *ColumnStore) Aggregate() *models.DashboardData {
 		data.TopRegions = data.TopRegions[:30]
 	}
 
-	// 3. Months (Merge Locals)
-	mergedMonths := make(map[int32]float64)
+	// 4. Monthly Sales
+	mergedMonths := make(map[int]float64)
 	for _, m := range monthPartial {
 		for k, v := range m {
 			mergedMonths[k] += v
 		}
 	}
-	for k, v := range mergedMonths {
-		mStr := fmt.Sprintf("%d-%02d", k/100, k%100)
-		data.MonthlySales = append(data.MonthlySales, models.MonthlyItem{Month: mStr, Volume: v})
+	sortedMonths := make([]int, 0, len(mergedMonths))
+	for k := range mergedMonths {
+		sortedMonths = append(sortedMonths, k)
 	}
-	sort.Slice(data.MonthlySales, func(i, j int) bool { return data.MonthlySales[i].Month < data.MonthlySales[j].Month })
+	sort.Ints(sortedMonths)
 
-	// 4. Country Table (Unpack Matrix)
-	for i, tx := range matrixTx {
-		if tx > 0 {
-			rev := matrixRev[i]
-			cid := i / numProds
-			pid := i % numProds
-			data.CountryTable = append(data.CountryTable, models.CountryRow{
-				Country: cs.CountryDict[cid], Product: cs.ProductDict[pid], Revenue: rev, Transactions: int(tx),
+	for _, mIdx := range sortedMonths {
+		if mIdx >= 1 && mIdx <= 12 {
+			data.MonthlySales = append(data.MonthlySales, models.MonthlyItem{
+				Month:  monthNames[mIdx],
+				Volume: mergedMonths[mIdx],
 			})
 		}
 	}
-	sort.Slice(data.CountryTable, func(i, j int) bool { return data.CountryTable[i].Revenue > data.CountryTable[j].Revenue })
 
 	return data
 }

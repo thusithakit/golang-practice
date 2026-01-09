@@ -2,6 +2,7 @@ package engine
 
 import (
 	"backend/internal/models"
+	"fmt"
 	"math"
 	"runtime"
 	"sort"
@@ -31,25 +32,24 @@ func (cs *ColumnStore) Aggregate() *models.DashboardData {
 	numRegs := len(cs.RegionDict)
 	numCountries := len(cs.CountryDict)
 
-	// Pre-allocate Arrays
 	prodSold := make([]float64, numProds)
 	prodStock := make([]int64, numProds)
 	regRev := make([]float64, numRegs)
 	regSold := make([]int64, numRegs)
-
-	// --- NEW: Country Arrays ---
-	// Tiny memory footprint (~200 items each)
 	ctryRev := make([]float64, numCountries)
 	ctryTx := make([]int64, numCountries)
 
 	// Workers
 	numWorkers := runtime.NumCPU()
 	chunkSize := len(cs.Dates) / numWorkers
-	monthPartial := make([]map[int]float64, numWorkers)
+
+	// NEW: Local map key is Date Int (YYYYMM)
+	// We aggregate by specific YYYYMM first, then split later
+	monthPartial := make([]map[int32]float64, numWorkers)
 	var wg sync.WaitGroup
 
 	for i := 0; i < numWorkers; i++ {
-		monthPartial[i] = make(map[int]float64)
+		monthPartial[i] = make(map[int32]float64)
 		start := i * chunkSize
 		end := start + chunkSize
 		if i == numWorkers-1 {
@@ -84,29 +84,27 @@ func (cs *ColumnStore) Aggregate() *models.DashboardData {
 				addFloat64(&regRev[rid], rev)
 				atomic.AddInt64(&regSold[rid], int64(qty))
 
-				// 3. Countries (Revenue + Transactions)
+				// 3. Countries
 				addFloat64(&ctryRev[cid], rev)
 				atomic.AddInt64(&ctryTx[cid], 1)
 
-				// 4. Months
-				mIdx := int(dates[j] % 100)
-				localMonths[mIdx] += rev
+				// 4. Monthly (Store full YYYYMM)
+				localMonths[dates[j]] += rev
 			}
 		}(i, start, end)
 	}
 	wg.Wait()
 
-	// --- Finalize & Format ---
+	// --- Finalize ---
 	data := &models.DashboardData{
-		CountryStats: make([]models.CountryStat, 0), // The Array you asked for
+		CountryStats: make([]models.CountryStat, 0),
 		TopProducts:  make([]models.TopItem, 0),
 		TopRegions:   make([]models.TopItem, 0),
-		MonthlySales: make([]models.MonthlyItem, 0),
+		MonthlySales: make(map[string][]models.MonthlyItem), // Map Init
 	}
 
-	// 1. Populate Country Stats
+	// 1. Country Stats
 	for i, revenue := range ctryRev {
-		// Include all countries, or filter if revenue > 0
 		if revenue > 0 {
 			data.CountryStats = append(data.CountryStats, models.CountryStat{
 				Country:      cs.CountryDict[i],
@@ -115,10 +113,7 @@ func (cs *ColumnStore) Aggregate() *models.DashboardData {
 			})
 		}
 	}
-	// Sort by Revenue (Highest first)
-	sort.Slice(data.CountryStats, func(i, j int) bool {
-		return data.CountryStats[i].Revenue > data.CountryStats[j].Revenue
-	})
+	sort.Slice(data.CountryStats, func(i, j int) bool { return data.CountryStats[i].Revenue > data.CountryStats[j].Revenue })
 
 	// 2. Products
 	for i, v := range prodSold {
@@ -146,27 +141,39 @@ func (cs *ColumnStore) Aggregate() *models.DashboardData {
 		data.TopRegions = data.TopRegions[:30]
 	}
 
-	// 4. Monthly Sales
-	mergedMonths := make(map[int]float64)
+	// 4. Monthly Sales (Split by Year)
+	// Merge partials first
+	merged := make(map[int32]float64)
 	for _, m := range monthPartial {
 		for k, v := range m {
-			mergedMonths[k] += v
+			merged[k] += v
 		}
 	}
-	sortedMonths := make([]int, 0, len(mergedMonths))
-	for k := range mergedMonths {
-		sortedMonths = append(sortedMonths, k)
-	}
-	sort.Ints(sortedMonths)
 
-	for _, mIdx := range sortedMonths {
-		if mIdx >= 1 && mIdx <= 12 {
-			data.MonthlySales = append(data.MonthlySales, models.MonthlyItem{
-				Month:  monthNames[mIdx],
-				Volume: mergedMonths[mIdx],
+	// Group by Year
+	// Temporary map: Year -> []Items
+	yearMap := make(map[string][]models.MonthlyItem)
+
+	// Sort keys first to ensure chronological insertion
+	sortedKeys := make([]int, 0, len(merged))
+	for k := range merged {
+		sortedKeys = append(sortedKeys, int(k))
+	}
+	sort.Ints(sortedKeys)
+
+	for _, dateInt := range sortedKeys {
+		y := dateInt / 100
+		m := dateInt % 100
+
+		yearStr := fmt.Sprintf("%d", y)
+		if m >= 1 && m <= 12 {
+			yearMap[yearStr] = append(yearMap[yearStr], models.MonthlyItem{
+				Month:  monthNames[m],
+				Volume: merged[int32(dateInt)],
 			})
 		}
 	}
+	data.MonthlySales = yearMap
 
 	return data
 }

@@ -1,11 +1,9 @@
 package models
 
 type DashboardData struct {
-	CountryStats []CountryStat `json:"country_stats"`
-	TopProducts  []TopItem     `json:"top_products"`
-	TopRegions   []TopItem     `json:"top_regions"`
-
-	// Changed: Key is Year (e.g., "2021"), Value is Jan-Dec data
+	CountryStats []CountryStat            `json:"country_stats"`
+	TopProducts  []TopItem                `json:"top_products"`
+	TopRegions   []TopItem                `json:"top_regions"`
 	MonthlySales map[string][]MonthlyItem `json:"monthly_sales"`
 }
 
@@ -16,9 +14,9 @@ type CountryStat struct {
 }
 
 type TopItem struct {
-	Name  string  `json:"name"`
-	Value float64 `json:"value"`
-	Extra int     `json:"extra,omitempty"`
+	Name  string  `json:"product_name"`
+	Value float64 `json:"items_sold"`
+	Extra int     `json:"available,omitempty"`
 }
 
 type MonthlyItem struct {

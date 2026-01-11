@@ -11,7 +11,7 @@ A high-throughput ETL engine built from scratch in Go. It ingests a **500MB+ dat
 | Metric | Standard Approach | This Engine | Improvement |
 | :--- | :--- | :--- | :--- |
 | **Load Time** | ~12.0s (encoding/csv) | **~1.5s** | **8x Faster** |
-| **Aggregation** | ~4.0s (Map Lookups) | **~1.1s** | **4x Faster** |
+| **Aggregation** | ~4.0s (Map Lookups) | **~400ms** | **10x Faster** |
 | **Memory** | ~2.5GB (Structs) | **~350MB** | **Low GC Pressure** |
 
 ---

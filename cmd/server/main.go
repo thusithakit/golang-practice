@@ -19,20 +19,16 @@ func main() {
 		log.Fatal("CSV not found")
 	}
 
-	// 1. LOAD
 	store := engine.LoadColumnar(csvFile)
 
-	// 2. AGGREGATE
 	log.Println("Aggregating...")
 	t0 := time.Now()
 	data := store.Aggregate()
 	log.Printf("Aggregation Complete in %v", time.Since(t0))
 
-	// Free memory (Optional)
 	store = nil
 	runtime.GC()
 
-	// 3. SERVE
 	e := echo.New()
 	e.Use(middleware.CORS())
 	e.Use(middleware.Logger())

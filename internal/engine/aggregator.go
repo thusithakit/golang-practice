@@ -27,7 +27,6 @@ func addFloat64(val *float64, delta float64) {
 }
 
 func (cs *ColumnStore) Aggregate() *models.DashboardData {
-	// Dimensions
 	numProds := len(cs.ProductDict)
 	numRegs := len(cs.RegionDict)
 	numCountries := len(cs.CountryDict)
@@ -44,7 +43,6 @@ func (cs *ColumnStore) Aggregate() *models.DashboardData {
 	chunkSize := len(cs.Dates) / numWorkers
 
 	// NEW: Local map key is Date Int (YYYYMM)
-	// We aggregate by specific YYYYMM first, then split later
 	monthPartial := make([]map[int32]float64, numWorkers)
 	var wg sync.WaitGroup
 
@@ -95,7 +93,6 @@ func (cs *ColumnStore) Aggregate() *models.DashboardData {
 	}
 	wg.Wait()
 
-	// --- Finalize ---
 	data := &models.DashboardData{
 		CountryStats: make([]models.CountryStat, 0),
 		TopProducts:  make([]models.TopItem, 0),
@@ -141,8 +138,7 @@ func (cs *ColumnStore) Aggregate() *models.DashboardData {
 		data.TopRegions = data.TopRegions[:30]
 	}
 
-	// 4. Monthly Sales (Split by Year)
-	// Merge partials first
+	// 4. Monthly Sales
 	merged := make(map[int32]float64)
 	for _, m := range monthPartial {
 		for k, v := range m {
@@ -150,11 +146,8 @@ func (cs *ColumnStore) Aggregate() *models.DashboardData {
 		}
 	}
 
-	// Group by Year
-	// Temporary map: Year -> []Items
 	yearMap := make(map[string][]models.MonthlyItem)
 
-	// Sort keys first to ensure chronological insertion
 	sortedKeys := make([]int, 0, len(merged))
 	for k := range merged {
 		sortedKeys = append(sortedKeys, int(k))

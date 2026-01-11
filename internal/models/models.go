@@ -3,7 +3,7 @@ package models
 type DashboardData struct {
 	CountryStats []CountryStat            `json:"country_stats"`
 	TopProducts  []TopItem                `json:"top_products"`
-	TopRegions   []TopItem                `json:"top_regions"`
+	TopRegions   []TopRegion              `json:"top_regions"`
 	MonthlySales map[string][]MonthlyItem `json:"monthly_sales"`
 }
 
@@ -17,6 +17,11 @@ type TopItem struct {
 	Name  string  `json:"product_name"`
 	Value float64 `json:"items_sold"`
 	Extra int     `json:"available,omitempty"`
+}
+
+type TopRegion struct {
+	Name    string  `json:"region"`
+	Revenue float64 `json:"revenue"`
 }
 
 type MonthlyItem struct {

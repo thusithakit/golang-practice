@@ -96,8 +96,8 @@ func (cs *ColumnStore) Aggregate() *models.DashboardData {
 	data := &models.DashboardData{
 		CountryStats: make([]models.CountryStat, 0),
 		TopProducts:  make([]models.TopItem, 0),
-		TopRegions:   make([]models.TopItem, 0),
-		MonthlySales: make(map[string][]models.MonthlyItem), // Map Init
+		TopRegions:   make([]models.TopRegion, 0),
+		MonthlySales: make(map[string][]models.MonthlyItem),
 	}
 
 	// 1. Country Stats
@@ -128,12 +128,12 @@ func (cs *ColumnStore) Aggregate() *models.DashboardData {
 	// 3. Regions
 	for i, v := range regRev {
 		if v > 0 {
-			data.TopRegions = append(data.TopRegions, models.TopItem{
-				Name: cs.RegionDict[i], Value: v, Extra: int(regSold[i]),
+			data.TopRegions = append(data.TopRegions, models.TopRegion{
+				Name: cs.RegionDict[i], Revenue: v,
 			})
 		}
 	}
-	sort.Slice(data.TopRegions, func(i, j int) bool { return data.TopRegions[i].Value > data.TopRegions[j].Value })
+	sort.Slice(data.TopRegions, func(i, j int) bool { return data.TopRegions[i].Revenue > data.TopRegions[j].Revenue })
 	if len(data.TopRegions) > 30 {
 		data.TopRegions = data.TopRegions[:30]
 	}
